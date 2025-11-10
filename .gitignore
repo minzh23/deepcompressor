@@ -173,3 +173,8 @@ runs/
 exps/
 wandb
 wandb/
+
+**/eval_results
+**/eval_metrics
+**/images
+**/checkpoints

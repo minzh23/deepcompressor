@@ -150,6 +150,87 @@ class NunchakuWeightPacker(MmaWeightPackerBase):
         scale = scale.permute(0, 5, 1, 4, 3, 2, 6).contiguous()
         return scale.view(-1, n)  # the shape is just used for validation
 
+    def pack_block_micro_scale(self, scale: torch.Tensor, group_size: int) -> torch.Tensor:
+        """Pack 16x16 block-wise scales for warp-efficient loads and broadcasts.
+
+        Assumptions
+        - Input `scale` is already per-block along N. Supported shapes:
+            [num_blocks_total, k_tiles * num_k_subtiles]
+            [num_blocks_total, k_tiles, num_k_subtiles]
+            [num_blocks_total, 1, total_k_groups, 1]  # e.g., block,1,total K/16,1
+          where `num_k_subtiles = insn_k // group_size`, `k_tiles = K / insn_k`, and
+          `total_k_groups = k_tiles * num_k_subtiles = K / group_size`.
+        - Each block covers `group_size` rows in N (e.g., 16). Thus the covered N is
+          `n = num_blocks_total * group_size`.
+        - `warp_n` is divisible by `group_size`. A warp covers `blocks_per_warp = warp_n / group_size` blocks.
+
+        Packing strategy
+        - For each warp tile in N, we have `blocks_per_warp = warp_n/16` blocks.
+          Split into even/odd indexed blocks to match lane-to-row mapping.
+        - Choose two loader lanes (e.g., lane 0 for even blocks, lane 2 for odd blocks).
+        - Each loader lane loads `s_pack_size` blocks per pack (prefer 4 so each load is 128b),
+          and repeats for `num_s_packs = ceil((blocks_per_warp/2)/s_pack_size)` packs.
+        - Arrange memory as `[num_warp_tiles, 2, num_s_packs, s_pack_size, 4]` of FP8, where dim=4 is 4 FP8 bytes.
+
+        Returns
+        - A contiguous tensor whose flattened layout follows `[num_warp_tiles, 2, num_s_packs, s_pack_size, num_k_subtiles]` ordering.
+          The exact 2D shape of the return matches existing conventions (the second dim is used only
+          for validation), so downstream code should treat it as a packed byte stream.
+        """
+        assert scale.dtype in (torch.float16, torch.bfloat16), "currently nunchaku only supports fp16 and bf16."
+        assert self.insn_k % group_size == 0, "insn_k must be divisible by group_size."
+        num_k_subtiles = self.insn_k // group_size
+        assert self.warp_n >= 32 and self.warp_n % group_size == 0, "warp_n must be >=32 and divisible by group_size."
+
+        # convert to fp8 and normalize shape to [num_blocks_total, k_tiles, num_k_subtiles]
+        scale = scale.to(dtype=torch.float8_e4m3fn)
+        num_blocks_total = scale.shape[0]
+        n = num_blocks_total * group_size
+        if scale.ndim == 4:
+            # shape: [num_blocks_total, 1, total_k_groups, 1]
+            assert scale.shape[1] == 1 and scale.shape[3] == 1, "4D input must be [num_blocks_total,1,total_k_groups,1]."
+            total_k_groups = scale.shape[2]
+            assert total_k_groups % num_k_subtiles == 0, "total_k_groups must be divisible by num_k_subtiles."
+            k_tiles = total_k_groups // num_k_subtiles
+            scale = scale.view(num_blocks_total, 1, k_tiles, num_k_subtiles)
+        else:
+            raise AssertionError(
+                "scale must be 4D: [num_blocks_total, 1, total_k_groups, 1]."
+            )
+
+        # group by warp tiles in N and split into even/odd 16-row blocks
+        blocks_per_warp = self.warp_n // group_size
+        assert num_blocks_total % blocks_per_warp == 0, "number of blocks should be divisible by blocks_per_warp."
+        num_warp_tiles = num_blocks_total // blocks_per_warp
+        scale = scale.view(num_warp_tiles, blocks_per_warp, k_tiles, num_k_subtiles)  # [tiles, blocks_per_warp, k_tiles, num_k_subtiles]
+
+        # split into even/odd block streams per warp tile
+        even = scale[:, 0::2, :, :]  # [tiles, blocks_per_warp/2, k_tiles, num_k_subtiles]
+        odd = scale[:, 1::2, :, :]   # [tiles, blocks_per_warp/2, k_tiles, num_k_subtiles]
+
+        half_blocks = even.shape[1]
+        # choose s_pack_size so that each load ~128b: s_pack_size * num_k_subtiles bytes ≈ 16B
+        target_elems = max(1, 16 // num_k_subtiles)
+        s_pack_size = min(target_elems, half_blocks)
+        num_s_packs = ceil_divide(half_blocks, s_pack_size)
+
+        # pad along the block dimension to make it divisible by s_pack_size
+        if half_blocks % s_pack_size != 0:
+            pad_blocks = num_s_packs * s_pack_size - half_blocks
+            pad_val = torch.tensor(1, dtype=scale.dtype, device=scale.device)
+            even = torch.cat([even, pad_val.expand(even.shape[0], pad_blocks, even.shape[2], num_k_subtiles)], dim=1)
+            odd = torch.cat([odd, pad_val.expand(odd.shape[0], pad_blocks, odd.shape[2], num_k_subtiles)], dim=1)
+
+        # reshape to packs
+        even = even.view(num_warp_tiles, num_s_packs, s_pack_size, k_tiles, num_k_subtiles)
+        odd = odd.view(num_warp_tiles, num_s_packs, s_pack_size, k_tiles, num_k_subtiles)
+
+        # arrange as [tiles, k_tiles, num_s_packs, 2, s_pack_size, num_k_subtiles]
+        packed = torch.stack([even, odd], dim=2).permute(0, 4, 1, 2, 3, 5).contiguous()
+
+        # return flattened stream; 2nd dim kept for validation (blocks*k_tiles)
+        return packed.view(-1, num_blocks_total * k_tiles)
+
     def pack_lowrank_weight(self, weight: torch.Tensor, down: bool) -> torch.Tensor:
         """Pack Low-Rank Weight.
 
@@ -231,6 +312,29 @@ class NunchakuWeightPacker(MmaWeightPackerBase):
             scale = pad(scale, divisor=self.warp_n, dim=0, fill_value=1)
         return scale
 
+    def pad_block_micro_scale(self, scale: torch.Tensor, group_size: int) -> torch.Tensor:
+        """Pad block-wise micro scales to align with warp tiles and instruction K tiles.
+
+        Expected input shape: [blocks, 1, total_k_groups, 1]
+          - blocks = n / group_size (number of N-blocks)
+          - total_k_groups = K / group_size (groups along K dimension)
+
+        Padding targets:
+          - blocks dimension (dim=0) to multiple of blocks_per_warp = warp_n / group_size
+          - total_k_groups dimension (dim=2) to multiple of num_k_subtiles = insn_k / group_size
+
+        Uses fill_value=1 so padded scales are neutral in later division.
+        """
+        assert scale.ndim == 4 and scale.shape[1] == 1 and scale.shape[3] == 1, (
+            "block micro scale must be [blocks, 1, total_k_groups, 1]."
+        )
+        assert group_size > 0, "group_size must be positive."
+        assert self.warp_n % group_size == 0, "warp_n must be divisible by group_size."
+        blocks_per_warp = self.warp_n // group_size
+        assert self.insn_k % group_size == 0, "insn_k must be divisible by group_size."
+        num_k_subtiles = self.insn_k // group_size
+        return pad(scale, divisor=(blocks_per_warp, num_k_subtiles), dim=(0, 2), fill_value=1)
+
     def pad_lowrank_weight(self, weight: torch.Tensor, down: bool) -> torch.Tensor:
         assert weight.ndim == 2, "weight tensor should be 2D."
         return pad(weight, divisor=self.warp_n, dim=1 if down else 0)
@@ -258,30 +362,85 @@ def convert_to_nunchaku_w4x4y16_linear_weight(
     assert scale is not None, "scale tensor is required for quantization."
 
     oc, ic = weight.shape
-    if scale.numel() == 1:
-        scale = scale.view(-1).expand(oc).reshape(oc, 1, 1, 1)
+    # Detect scale modes (micro/block) for scale and subscale independently
+    is_per_tensor = scale.numel() == 1
+    per_tensor_scale = False
+    is_block_micro_scale = False
+    if is_per_tensor:
         per_tensor_scale = True
+        ng, gs = 1, ic
     else:
-        per_tensor_scale = False
-    assert scale.ndim == 4, "scale tensor should be 4D."
-    assert scale.shape[1] == scale.shape[3] == 1
-    assert scale.shape[0] == oc
-    ng, gs = scale.shape[2], ic // scale.shape[2]
-    assert ic == gs * ng, "input channel size should be equal to group size times number of groups."
+        assert scale.ndim == 4 and scale.shape[1] == scale.shape[3] == 1, "scale tensor should be [*,1,*,1]."
+        is_micro_scale = (scale.shape[0] != 1 and scale.shape[2] != 1)
+        if is_micro_scale and scale.shape[0] != oc:
+            # block-wise micro scale: [blocks,1,total_k_groups,1]
+            blocks = scale.shape[0]
+            total_k_groups = scale.shape[2]
+            gs = ic // total_k_groups  # K-side group size
+            assert blocks > 0 and oc % blocks == 0, "oc must be divisible by number of blocks."
+            block_height = oc // blocks  # N-side block height
+            assert block_height == gs, "block height must equal K group size for block-micro scale."
+            ng = total_k_groups
+            is_block_micro_scale = True
+        else:
+            assert scale.shape[0] == oc, "scale's dim0 must equal oc unless using block-micro scale."
+            ng = scale.shape[2]
+            gs = ic // ng
+        assert ic == gs * ng, "input channel size should be equal to group size times number of groups."
+
+    is_block_micro_subscale = False
     if subscale is not None:
-        assert subscale.ndim == 4, "subscale tensor should be 4D."
-        assert subscale.shape[1] == subscale.shape[3] == 1
-        assert subscale.shape[0] == oc
-        nsg, sgs = subscale.shape[2], ic // subscale.shape[2]
-        assert ic == sgs * nsg, "input channel size should be equal to subgroup size times number of subgroups."
-        assert gs > sgs and gs % sgs == 0, "group size should be divisible by subgroup size."
+        assert subscale.ndim == 4 and subscale.shape[1] == subscale.shape[3] == 1, "subscale should be [*,1,*,1]."
+        is_micro_subscale = (subscale.shape[0] != 1 and subscale.shape[2] != 1)
+        if is_micro_subscale and subscale.shape[0] != oc:
+            blocks_s = subscale.shape[0]
+            total_k_subgroups = subscale.shape[2]
+            sgs = ic // total_k_subgroups
+            assert blocks_s > 0 and oc % blocks_s == 0, "oc must be divisible by number of blocks (subscale)."
+            block_height_s = oc // blocks_s
+            # subscale subgroup size must divide parent group size
+            nsg = total_k_subgroups
+            assert gs > sgs and gs % sgs == 0, "group size should be divisible by subgroup size."
+            # For strict 16x16 case often block_height_s == sgs
+            is_block_micro_subscale = True
+        else:
+            assert subscale.shape[0] == oc, "subscale's dim0 must equal oc unless using block-micro subscale."
+            nsg, sgs = subscale.shape[2], ic // subscale.shape[2]
+            assert ic == sgs * nsg, "input channel size should be equal to subgroup size times number of subgroups."
+            assert gs > sgs and gs % sgs == 0, "group size should be divisible by subgroup size."
     else:
         nsg, sgs = ng, gs
     # region quantize and pack weight tensor
-    weight = weight.to(dtype=torch.float32).view(oc, 1, ng, gs).div_(scale.to(dtype=torch.float32, device=device))
+    weight = weight.to(dtype=torch.float32)
+    if per_tensor_scale:
+        scale_quant = scale.view(-1).expand(oc).reshape(oc, 1, 1, 1)
+        weight = weight.view(oc, 1, ng, gs).div_(scale_quant.to(dtype=torch.float32, device=device))
+        weight = weight.view(oc, ic)
+    elif is_block_micro_scale:
+        blocks = scale.shape[0]
+        total_k_groups = scale.shape[2]
+        block_height = oc // blocks
+        # reshape to [blocks, block_height, 1, ng, gs] and broadcast divide by [blocks,1,1,ng,1]
+        weight = weight.view(blocks, block_height, ng, gs).div_(
+            scale.view(blocks, 1, ng, 1).to(dtype=torch.float32, device=device)
+        )
+        weight = weight.view(oc, ic)
+    else:
+        weight = weight.view(oc, 1, ng, gs).div_(scale.to(dtype=torch.float32, device=device))
+        weight = weight.view(oc, ic)
     if subscale is not None:
-        weight = weight.view(oc, 1, nsg, sgs).div_(subscale.to(dtype=torch.float32, device=device))
-    weight = weight.view(oc, ic)
+        if is_block_micro_subscale:
+            blocks_s = subscale.shape[0]
+            total_k_subgroups = subscale.shape[2]
+            block_height_s = oc // blocks_s
+            # 4D broadcast: [blocks_s, block_height_s, nsg, sgs] / [blocks_s, 1, nsg, 1]
+            weight = weight.view(blocks_s, block_height_s, nsg, sgs).div_(
+                subscale.view(blocks_s, 1, nsg, 1).to(dtype=torch.float32, device=device)
+            )
+            weight = weight.view(oc, ic)
+        else:
+            weight = weight.view(oc, 1, nsg, sgs).div_(subscale.to(dtype=torch.float32, device=device))
+            weight = weight.view(oc, ic)
     if float_point:
         weight = fp_quantize(weight)
         assert weight.min() >= 0 and weight.max() <= 15, "quantized weight should be in [0, 15]."
@@ -294,16 +453,28 @@ def convert_to_nunchaku_w4x4y16_linear_weight(
 
     packer = NunchakuWeightPacker(bits=4)
     weight = packer.pad_weight(weight.to(dtype=torch.int32))
-    scale = packer.pad_scale(scale.to(dtype=dtype), group_size=gs)
+    if is_block_micro_scale:
+        scale = packer.pad_block_micro_scale(scale.to(dtype=dtype), group_size=gs)
+    else:
+        scale = packer.pad_scale(scale.to(dtype=dtype), group_size=gs)
     if subscale is not None:
-        subscale = packer.pad_scale(subscale.to(dtype=dtype), group_size=sgs)
+        if is_block_micro_subscale:
+            subscale = packer.pad_block_micro_scale(subscale.to(dtype=dtype), group_size=sgs)
+        else:
+            subscale = packer.pad_scale(subscale.to(dtype=dtype), group_size=sgs)
     bias = packer.pad_scale(bias.to(dtype=dtype), group_size=-1)
     smooth = packer.pad_scale(smooth.to(dtype=dtype), group_size=-1)
 
     weight = packer.pack_weight(weight)
-    scale = packer.pack_scale(scale, group_size=gs if gs < ic else -1)
+    if is_block_micro_scale:
+        scale = packer.pack_block_micro_scale(scale, group_size=gs)
+    else:
+        scale = packer.pack_scale(scale, group_size=gs if gs < ic else -1)
     if subscale is not None:
-        subscale = packer.pack_scale(subscale, group_size=sgs if sgs < ic else -1)
+        if is_block_micro_subscale:
+            subscale = packer.pack_block_micro_scale(subscale, group_size=sgs)
+        else:
+            subscale = packer.pack_scale(subscale, group_size=sgs if sgs < ic else -1)
     bias = packer.pack_scale(bias, group_size=-1)
     smooth = packer.pack_scale(smooth, group_size=-1)
     if lora is not None:

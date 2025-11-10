@@ -5,9 +5,10 @@ eval:
   num_steps: 50
   guidance_scale: 3.5
   protocol: fmeuler{num_steps}-g{guidance_scale}
+  benchmarks: ["MJHQ"]
 quant:
   calib:
-    batch_size: 16
+    batch_size: 1
   wgts:
     calib_range:
       element_batch_size: 64

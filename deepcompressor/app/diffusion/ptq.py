@@ -373,6 +373,11 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
 
 
 if __name__ == "__main__":
+    # import debugpy
+    # print("Waiting for debugger to attach...")
+    # debugpy.listen(5678)    
+    # debugpy.wait_for_client()
+    # print("Debugger attached")
     config, _, unused_cfgs, unused_args, unknown_args = DiffusionPtqRunConfig.get_parser().parse_known_args()
     assert isinstance(config, DiffusionPtqRunConfig)
     if len(unused_cfgs) > 0:

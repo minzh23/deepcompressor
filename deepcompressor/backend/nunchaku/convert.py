@@ -381,6 +381,11 @@ def convert_to_nunchaku_flux_state_dicts(
 
 
 if __name__ == "__main__":
+    import debugpy
+    debugpy.listen(5678)
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger attached")
     parser = argparse.ArgumentParser()
     parser.add_argument("--quant-path", type=str, required=True, help="path to the quantization checkpoint directory.")
     parser.add_argument("--output-root", type=str, default="", help="root to the output checkpoint directory.")
@@ -398,7 +403,7 @@ if __name__ == "__main__":
     assert model_name, "Model name must be provided."
     assert "flux" in model_name.lower(), "Only Flux models are supported."
     state_dict_path = os.path.join(args.quant_path, "model.pt")
-    scale_dict_path = os.path.join(args.quant_path, "scale.pt")
+    scale_dict_path = os.path.join(args.quant_path, "scale_blockwise.pt")
     smooth_dict_path = os.path.join(args.quant_path, "smooth.pt")
     branch_dict_path = os.path.join(args.quant_path, "branch.pt")
     map_location = "cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
