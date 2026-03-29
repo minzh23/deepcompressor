@@ -343,7 +343,7 @@ class BaseCalibCacheLoader(ABC):
             for layer_idx, (layer_name, layer) in enumerate(named_layers.items()):
                 # region we first register hooks for caching activations
                 layer_hooks: list[Hook] = []
-                for module_name, module, needs_inputs, needs_outputs in hook_args[layer_name]:
+                for module_name, module, needs_inputs, needs_outputs in hook_args.get(layer_name, []):
                     layer_hooks.extend(
                         action.register(
                             name=module_name,
@@ -354,7 +354,7 @@ class BaseCalibCacheLoader(ABC):
                             needs_outputs=needs_outputs,
                         )
                     )
-                hook_args.pop(layer_name)
+                hook_args.pop(layer_name, None)
                 # endregion
                 if recomputes[layer_idx]:
                     if layers is None:
@@ -415,12 +415,12 @@ class BaseCalibCacheLoader(ABC):
                     ]
                 gc.collect()
                 torch.cuda.empty_cache()
-                yield layer_name, (layer, cache[layer_name], layer_inputs)
+                yield layer_name, (layer, cache.get(layer_name, {}), layer_inputs)
                 # region clear layer cache
                 if clear_after_yield:
-                    for module_cache in cache[layer_name].values():
+                    for module_cache in cache.get(layer_name, {}).values():
                         module_cache.clear()
-                cache.pop(layer_name)
+                cache.pop(layer_name, None)
                 del layer_inputs
                 gc.collect()
                 torch.cuda.empty_cache()

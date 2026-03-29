@@ -166,6 +166,7 @@ cython_debug/
 .DS_Store
 *.log
 *.pt
+*.safetensors
 .tmp/
 runs
 exps

@@ -381,11 +381,11 @@ def convert_to_nunchaku_flux_state_dicts(
 
 
 if __name__ == "__main__":
-    import debugpy
-    debugpy.listen(5678)
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger attached")
+    # import debugpy
+    # debugpy.listen(5678)
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger attached")
     parser = argparse.ArgumentParser()
     parser.add_argument("--quant-path", type=str, required=True, help="path to the quantization checkpoint directory.")
     parser.add_argument("--output-root", type=str, default="", help="root to the output checkpoint directory.")
